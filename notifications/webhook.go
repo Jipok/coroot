@@ -3,10 +3,9 @@ package notifications
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
-	"reflect"
 	"strings"
 	"text/template"
 
@@ -16,84 +15,129 @@ import (
 )
 
 type WebHook struct {
-	webhookUrl string
-	correctJSON string
-	incidentTemplate string
+	webhookUrl         string
+	incidentTemplate   string
+	deploymentTemplate string
 }
 
 type IncidentTemplateValues struct {
-	StatusOK bool
-	StatusINFO bool
-	StatusWARNING bool
-	StatusCRITICAL bool
-	Status string
-	App model.ApplicationId
-	Reports []db.IncidentNotificationDetailsReport
-	URL string
+	Status    string
+	App       model.ApplicationId
+	Reports   []db.IncidentNotificationDetailsReport
+	URL       string
 	Timestamp timeseries.Time
 }
 
-func NewWebHook(webhookUrl, correctJSON, incidentTemplate string) *WebHook {
+type Project struct {
+	Id   string
+	Name string
+}
+
+type DeploymentTemplateValues struct {
+	Status  string
+	App     model.ApplicationId
+	Project Project
+	Summary []string
+	URL     string
+}
+
+func NewWebHook(webhookUrl string, incidentTemplate string, deploymentTemplate string) *WebHook {
 	return &WebHook{
-		webhookUrl: webhookUrl,
-		correctJSON: correctJSON,
-		incidentTemplate: incidentTemplate,
+		webhookUrl:         webhookUrl,
+		incidentTemplate:   incidentTemplate,
+		deploymentTemplate: deploymentTemplate,
 	}
 }
 
 func (t *WebHook) SendIncident(ctx context.Context, baseUrl string, n *db.IncidentNotification) error {
-	// Parse template
 	tmpl, err := template.New("incidentTemplate").Parse(t.incidentTemplate)
 	if err != nil {
 		return fmt.Errorf("WebHookIntegration: cant parse incidentTemplate: %s", err)
 	}
-	// Fill template
+
 	var data bytes.Buffer
 	err = tmpl.Execute(&data, IncidentTemplateValues{
-		StatusOK: n.Status == model.OK,
-		StatusINFO: n.Status == model.INFO,
-		StatusWARNING: n.Status == model.WARNING,
-		StatusCRITICAL: n.Status == model.CRITICAL,
-		Status: strings.ToUpper( fmt.Sprint(n.Status) ),
-		App: n.ApplicationId,
-		Reports: n.Details.Reports,
-		URL: incidentUrl(baseUrl, n),
+		Status:    strings.ToUpper(fmt.Sprint(n.Status)),
+		App:       n.ApplicationId,
+		Reports:   n.Details.Reports,
+		URL:       incidentUrl(baseUrl, n),
 		Timestamp: n.Timestamp,
 	})
 	if err != nil {
 		return fmt.Errorf("WebHookIntegration: cant fill incidentTemplate: %s", err)
 	}
 
-	// Send
 	resp, err := http.Post(t.webhookUrl, "application/json", &data)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	// Check response
-	//
-	// Unpack correct_json in map[string]interface{}
-	var correctData map[string]interface{}
-	err = json.Unmarshal([]byte(t.correctJSON), &correctData)
+	return t.validateResponse(resp)
+}
+
+func (t *WebHook) SendDeployment(ctx context.Context, project *db.Project, ds model.ApplicationDeploymentStatus) error {
+	tmpl, err := template.New("deploymentTemplate").Parse(t.deploymentTemplate)
 	if err != nil {
-		return fmt.Errorf("WebHookIntegration: invalid correctJSON: %s", err)
+		return fmt.Errorf("WebHookIntegration: cant parse deploymentTemplate: %s", err)
 	}
-	// Unpack resp_json in map[string]interface{}
-	var respData map[string]interface{}
-	err = json.NewDecoder(resp.Body).Decode(&respData)
-	if err != nil {
-		return fmt.Errorf("WebHookIntegration: invalid response from endpoint: %s", err)
+
+	d := ds.Deployment
+
+	status := "Deployed"
+	switch ds.State {
+	case model.ApplicationDeploymentStateInProgress:
+		return nil
+	case model.ApplicationDeploymentStateStuck:
+		status = "Stuck"
+	case model.ApplicationDeploymentStateCancelled:
+		status = "Cancelled"
 	}
-	// Check all fields(and values) from correct_json in resp_json
-	for key, value := range correctData {
-		respValue, ok := respData[key]
-		if !ok {
-			return fmt.Errorf("WebHookIntegration: endpoint doesn't contains field:\n%s", key)
-		} else if !reflect.DeepEqual(value, respValue) {
-			return fmt.Errorf("WebHookIntegration: endpoint response %s == %s: %s", key, respValue, respData)
+
+	var summary []string
+
+	if ds.State == model.ApplicationDeploymentStateSummary {
+		summary = append(summary, "No notable changes")
+		if len(ds.Summary) > 0 {
+			for _, s := range ds.Summary {
+				summary = append(summary, fmt.Sprintf("%s %s", s.Emoji(), s.Message))
+			}
 		}
 	}
 
+	var data bytes.Buffer
+	var projectDeploy = Project{
+		Name: *&project.Name,
+		Id:   string(project.Id),
+	}
+
+	err = tmpl.Execute(&data, DeploymentTemplateValues{
+		Status:  status,
+		App:     d.ApplicationId,
+		Project: projectDeploy,
+		Summary: summary,
+		URL:     deploymentUrl(project.Settings.Integrations.BaseUrl, project.Id, d),
+	})
+	if err != nil {
+		return fmt.Errorf("WebHookIntegration: cant fill deploymentTemplate: %s", err)
+	}
+
+	resp, err := http.Post(t.webhookUrl, "application/json", &data)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return t.validateResponse(resp)
+}
+
+func (t *WebHook) validateResponse(resp *http.Response) error {
+	if resp.StatusCode != http.StatusOK {
+		respBody, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("WebHookIntegration: error reading response body: %s", err)
+		}
+		return fmt.Errorf("WebHookIntegration: invalid response status code: %d, response body: %s", resp.StatusCode, string(respBody))
+	}
 	return nil
 }
